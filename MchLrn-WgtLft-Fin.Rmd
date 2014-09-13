@@ -1,0 +1,314 @@
+---
+title: "MchLrn-WgtLft-Fin"
+date: "September 11, 2014"
+output: html_document
+---
+
+
+## Data Download and Library Set Up
+
+```{r}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "../R-Data/pml-training.csv", method = "curl")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "../R-Data/pml-testing.csv", method = "curl")
+# Training Data
+trn.dat <- read.csv("../R-Data/pml-training.csv", na.strings = c("NA", "", "#DIV/0!"))
+# Test Data
+tst.dat <- read.csv("../R-Data/pml-testing.csv", na.strings = c("NA", "", "#DIV/0!"))
+
+library(caret)
+library(ggplot2)
+library(rattle)
+library(rpart.plot)
+library(ipred)
+library(class)
+library(randomForest)
+```
+
+## Data Exploration and Feature Extraction
+
+We split the original training data set into 3 subsets:  
+1. A true training data set used for data preprocessing and model training  
+2. A validation data set used for assessing performance and selecting model  
+3. An error prediction data set used for out-of-sample error prediction, for the model we end up selecting based on its performance on the validation set that we referred to in step 2 above.  
+
+We choose a 70:15:15 split for the 3 data sets, out of the original training set.  
+
+```{r} 
+#
+# Start by splitting the training data into training and validation sets
+#
+
+set.seed(13931)
+inTrain <- createDataPartition(y = trn.dat$classe, p = 0.7, list = FALSE)
+trn <- trn.dat[inTrain, ]
+val <- trn.dat[-inTrain, ]
+
+#
+# Now further split the validation data into validation and error prediction sets
+#
+
+set.seed(12421)
+inVal <- createDataPartition(y = val$classe, p = 0.5, list = FALSE)
+err <- val[-inVal,]
+val <- val[inVal,]
+```
+
+We now perform some data exploration ahead of feature extraction.
+We do all this on the reduced training data set to avoid any data snooping.  
+
+```{r eval =FALSE}
+dim(trn)
+dim(val)
+dim(err)
+
+str(trn)
+```
+
+The data includes 159 predictors and a response variable ("classe").  
+We see many variables with large numbers of NA values, so we start by identifying these in order to remove them. We define a function to calculate the ratio of NA entries in a given vector, and we apply it to the columns of the training data set.  
+
+```{r}
+na.ratio <- function(x) {
+    n <- length(x)
+    y <- is.na(x)
+    return(sum(y)/n)
+}
+
+na.rates <- apply(trn, 2, na.ratio)
+# na.rates
+sum(na.rates > 0.95)
+```
+
+We see that 100 of the predictors have NA in over 95% of their instances.
+We remove these predictors from the data set to make the analysis wieldy.
+It turns out that the rates of NA are either 97%-98% or else near zero.
+
+```{r}
+trn.use <- trn[, which(na.rates < 0.95)]
+val.use <- val[, which(na.rates < 0.95)]
+err.use <- err[, which(na.rates < 0.95)]
+tst.use <- tst.dat[, which(na.rates < 0.95)]
+
+dim(trn.use); dim(val.use); dim(err.use)
+dim(tst.use)
+
+hist(as.numeric(trn.use$new_window))
+hist(trn.use$num_window)
+```
+
+We also notice that the first predictors are names or identifiers or timestamps.
+We remove these as well, given their very low likelihood of any predictive value.
+These correspond to the first 7 predictors (and columns) in the data frames.  
+
+```{r}
+trn.use <- trn.use[, -(1:7)]
+val.use <- val.use[, -(1:7)]
+err.use <- err.use[, -(1:7)]
+tst.use <- tst.use[, -(1:7)]
+dim(trn.use); dim(val.use); dim(err.use); dim(tst.use)
+```
+
+Finally, we check for any further opportunities for reducing predictors without loss of predictive value. We do this by checking for low variance predictors.  
+
+```{r}
+nzv <- nearZeroVar(trn.use, saveMetrics = TRUE)
+sum((nzv$nzv == TRUE))
+```
+
+All remaining predictors exhibit non-zero variability so there are no grounds for excluding any further variables from the models based on this criterion. If we intended to use linear methods and make inferences on model parameters, where collinearity among covariates is an issue, we would check the correlation matrix and possibly perform PCA to achieve both dimensionality reduction and transformation of features towards orthogonal ones.   
+
+However, we intend to use classification schemes based on trees and variations
+on trees (random forests and stochastic gradient boosting), so we skip the steps above.  
+
+We are done with feature preprocessing, if all we want to train are models that do not require specific distributions on the data. If we considered models such as LDA (Linear Discriminant Analysis) or QDA (Quadratic Discriminant Analysis), then we'd want to examine the validity of Gaussian assumptions, on the one hand, and the validity of uniformity of covariance assumptions (for LDA), and possibly explore feature transformations (log or otherwise) in case of skews or other salient signs of non-Gaussian shape in the data.  
+
+```{r}
+#install.packages("parallel")
+library(parallel)
+#install.packages("bigmemory")
+#library(bigmemory)
+```
+
+# Model Development on the Training Set
+
+We now develop a couple of models on the subset of the original training set which we have carved out for true training (as opposed to the other subsets which we have earmarked for model evaluation and out-of-sample error prediction, respectively).  
+
+## Single Decision Tree with RPART
+
+```{r}
+set.seed(14741)
+system.time( rpart.mod <- train(classe ~ ., data = trn.use, method = "rpart") )
+#
+# The response variable "classe" is the last in the data frame,
+# so its position can be referred to via a call to ncol()
+#
+rpart.pred <- predict(rpart.mod, val.use[, -ncol(val.use)])
+confusionMatrix(rpart.pred, val.use[, ncol(val.use)])
+```
+
+The accuracy of this tree model when applied to predicting on the validation set is 0.50 and kappa is 0.35, which is weak.  
+We train more powerful models: random forest and stochastic gradient boosting.  
+
+## Random Forest Model with Cross-Validation
+
+```{r}
+#install.packages("doMC")
+#install.packages("doSNOW")
+#nlibrary(doMC)
+library(doSNOW)
+cores <- detectCores()
+clust <- makeCluster(cores)
+#registerDoMC(clust)
+registerDoSNOW(clust)
+getDoParWorkers()
+getDoParRegistered()
+getDoParName()
+#
+# In anticipation of long computing times on my low-end laptop,
+# I first try out subsets of the training set to get some idea.
+#
+# With 20% of the training set used, and single-core execution:
+# --> RF took around 7 minutes to complete without parallelism
+# --> RF produced Accuracy of 0.9674 and Kappa of 0.9587 on the validation set
+#
+# With 50% of the training set used, and single-core execution:
+# --> RF took around 23 minutes to complete without parallelism
+# --> RF produced Accuracy of 0.9837 and Kappa of 0.9794 on the validation set
+#
+# With 50% of the training set used, and dual-core execution:
+# --> RF took around 14 minutes to complete with parallelism
+# --> RF produced Accuracy of 0.9844 and Kappa of 0.9802 on the validation set
+#
+
+# sample.idx <- sample(1:nrow(trn.use), as.integer(0.50 * nrow(trn.use)), replace = FALSE)
+# try.use <- trn.use [sample.idx, ]
+# tr.ctl <- trainControl(method = "cv", number = 10, allowParallel = TRUE)
+# system.time( rf.mod <- train(classe ~ ., data = try.use, method = "rf", trControl = tr.ctl) )
+```
+
+We now go for training a Random Forest on the 70% subset of the original training set which we have allocated for model development, with 10-fold cross-validation for parameter tuning and error prediction. We then run a prediction on the 15% subset of the original training set which we have set aside for validation and measurement of the generalised (out-of-sample) error.  
+
+```{r}
+set.seed(12321)
+tr.ctl <- trainControl(method = "cv", number = 10, allowParallel = TRUE)
+system.time( rf.mod <- train(classe ~ ., data = trn.use, method = "rf", trControl = tr.ctl) )
+stopCluster(clust)
+rf.mod
+rf.pred <- predict(rf.mod, val.use[, -ncol(val.use)])
+confusionMatrix(rf.pred, val.use[, ncol(val.use)])
+#
+# With the entire (100%) training set, and dual-core execution:
+# --> RF took around 38 minutes to complete with parallelism
+# --> RF produced in-sample Accuracy of 0.993 and Kappa of 0.991 (10-fold CV)
+# --> RF produced Accuracy of 0.9925 and Kappa of 0.9905 on the validation set
+#
+```
+
+## Stochastic Gradient Boosting Model with Cross Validation
+
+```{r}
+#modelLookup("gbm")
+#getModelInfo("gbm")
+clust <- makeCluster(cores)
+registerDoSNOW(clust)
+set.seed(12321)
+system.time( gbm.mod <- train(classe ~ ., data = trn.use, method = "gbm", trControl = tr.ctl) )
+stopCluster(clust)
+gbm.mod
+gbm.pred <- predict(gbm.mod, val.use[, -ncol(val.use)])
+confusionMatrix(gbm.pred, val.use[, ncol(val.use)])
+#
+# With the entire (100%) training set, and dual-core execution:
+# --> GBM took about 11 minutes to complete with parallelism
+# --> GBM produced in-sample Accuracy of 0.962 and Kappa of 0.952 (10-fold cross-validated)
+# --> GBM produced Accuracy of 0.9616 and Kappa of 0.9514 on the validation set
+#
+```
+
+
+## Model Selection
+
+We have trained 3 models on the training set made of a random subset of 70% of the original training data: a decision tree using the recursive partitioning "rpart" method, a random forest "rf" method, and a stochastic gradient boosting "gbm" method. When we have made predictions from these models on the validation data set made of another random subset of 15% of the original training data, we have found that the Random Forest model performed the best, with Accuracy = 99.25% and Kappa = 99.05% values.  
+
+It is useful to note that, for all models we have trained, we have obtained in-sample (on 70% of the original training set), 10-fold cross-validated, accuracy levels that are very close to the accuracy levels obtained by making predictions on an untainted validation set (15% of the original training set). This gives us 2 ways of estimating out-of-sample accuracy levels (or, inversely, error rates).  
+
+We therefore pick the Random Forest model as the best predictor based on its performance on the validation set as well as in cross-validated manner on the training sample itself.  
+
+
+## Out of Sample Prediction Error
+
+In order to further estimate out-of-sample prediction error, we apply the selected Random Forest model to the remaining 15% subset of the original training data that has not been visited at all so far, neither for training of the various models nor even for validation and model selection, and which we have set aside as a data frame called "err.use" .
+
+```{r}
+rf.oos <- predict(rf.mod, err.use[, -ncol(err.use)])
+confusionMatrix(rf.oos, err.use[, ncol(err.use)])
+```
+
+We obtained from this model Accuracy = 99.42% and Kappa = 99.27%, and these are even higher performance numbers than those obtained on the validation subset which we used to select the best model (99.25% for Accuracy and 99.05% for Kappa) and than those obtained via 10-fold cross-validation on the effective training set (99.3% for Accuracy and 99.1% for Kappa). The 95% confidence interval for Accuracy from this model is [99.08% - 99.66%], making 99.1% a good lower bound on the estimated out-of-sample accuracy.  
+
+Using 3 different methods of estimating out-of-sample Accuracy:  
+- Ten-fold cross-validation on the training set  
+- Prediction on a validation set used for the purpose of model selection among diverse models ("rpart", "rf", "gbm")  
+- Prediction on another test set not used at all in any of the above, not even in model selection.  
+
+We obtain Accuracy levels for the Random Forest model trained on 70% of the original training set that all exceed 99.25%, and with a 95% confidence interval of [99.08% - 99.66%] for that Accuracy. We can therefore state that we are 95% confident that the out-of-sample Accuracy of our selected RF model is 99.1% or better, and that the out-of-sample prediction error is correspondingly of 0.9% or less.  
+
+## Prediction on the True Test Set of the Assignment
+
+```{r}
+final.preds <- predict(rf.mod, tst.use[, -53])
+final.preds
+# [1] B A B A A E D B A A B C B A E E A B B B
+# Levels: A B C D E
+```
+
+## Double Check Results with RF Model Trained on the Entire Training Set
+
+```{r}
+#
+# Data frame of entire original training set, with the relevant 53 predictors
+tot.use <- trn.dat[, which(na.rates < 0.95)]
+tot.use <- tot.use[, -(1:7)]
+dim(tot.use)
+clust <- makeCluster(cores)
+registerDoSNOW(clust)
+set.seed(14741)
+system.time( rff.mod <- train(classe ~ ., data = tot.use, method = "rf", trControl = tr.ctl) )
+#    user   system  elapsed 
+# 102.542   23.565 3368.495
+stopCluster(clust)
+rff.mod
+# Random Forest 
+# 
+# 19622 samples
+#    52 predictors
+#     5 classes: 'A', 'B', 'C', 'D', 'E' 
+# 
+# No pre-processing
+# Resampling: Cross-Validated (10 fold) 
+# 
+# Summary of sample sizes: 17661, 17660, 17659, 17660, 17660, 17660, ... 
+# 
+# Resampling results across tuning parameters:
+# 
+#   mtry  Accuracy  Kappa  Accuracy SD  Kappa SD
+#   2     0.996     0.994  0.0023       0.00291 
+#   27    0.995     0.994  0.00164      0.00207 
+#   52    0.99      0.987  0.00318      0.00403 
+# 
+# Accuracy was used to select the optimal model using  the largest value.
+# The final value used for the model was mtry = 2. 
+
+rff.preds <- predict(rff.mod, tst.use[, -53])
+rff.preds
+# [1] B A B A A E D B A A B C B A E E A B B B
+# Levels: A B C D E
+```
+
+## Conclusion:
+
+The 10-fold cross-validated random forest model trained on a 70% subset of the original training data produces the same prediction as the 10-fold cross-validated random forest model trained on 100% of the original training set, when applied to the assigned test set of 20 entries. Also, and as stated in the out-of-sample error estimation section above, we are confident at a 95% level that the out-of-sample accuracy level of our model is upward of 99.1%, i.e., the out-of-sample error is less than 0.9% with 95% confidence.
+
+
+
+
